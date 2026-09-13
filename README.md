@@ -2,21 +2,18 @@
 
 A SPICE netlist in, node voltages out — Modified Nodal Analysis assembled by
 hand in numpy, no circuit-solver library involved. The whole simulator is one
-file, [`mna.py`](mna.py), with its test suite in
-[`test_mna.py`](test_mna.py).
+file, [`mna.py`](mna.py).
 
-```console
-$ python mna.py divider.cir
-* Voltage divider -- 10V across two 1k resistors
-node          voltage (V)
-1                      10
-2                       5
-
-source        current (A)
-V1                 -0.005
+```
+Voltage divider -- 10V across two 1k resistors        node    voltage (V)
+V1 1 0 10                                       -->   1              10
+R1 1 2 1k                                             2               5
+R2 2 0 1k
+.op                                                   source  current (A)
+.end                                                  V1         -0.005
 ```
 
-## What it does
+## Key features
 
 | Analysis | Directive | Notes |
 |---|---|---|
@@ -26,62 +23,19 @@ V1                 -0.005
 | Transient | `.tran tstep tstop [be\|trap]` | fixed-step companion models, backward Euler or trapezoidal |
 | Nonlinear DC | automatic with a diode | Newton-Raphson with voltage limiting |
 
-Elements: resistors, independent voltage/current sources, capacitors,
-inductors, all four controlled sources (VCVS/VCCS/CCVS/CCCS), and a Shockley
-diode.
-
-## Install
-
-Requires Python 3.9+ and numpy (plus pytest to run the tests).
-
-```bash
-python -m venv .venv && source .venv/bin/activate && pip install numpy pytest
-```
-
-There is nothing to build or install — `mna.py` is a plain module.
-
-## Quickstart
-
-Write a netlist:
-
-```
-Voltage divider -- 10V across two 1k resistors
-V1 1 0 10
-R1 1 2 1k
-R2 2 0 1k
-.op
-.end
-```
-
-and run it:
-
-```bash
-python mna.py divider.cir
-```
-
-Or drive it from Python:
-
-```python
-from mna import Circuit, Resistor, VoltageSource
-
-c = Circuit()
-c.add(VoltageSource("V1", "1", "0", 10.0))
-c.add(Resistor("R1", "1", "2", 1000.0))
-c.add(Resistor("R2", "2", "0", 1000.0))
-
-voltages, currents = c.solve()   # {'1': 10.0, '2': 5.0}, {'V1': -0.005}
-```
-
-The same circuit objects feed the other analyses:
-
-```python
-from mna import ac_sweep, dc_sweep, solve_nonlinear_dc, transient
-
-dc_sweep(c, "V1", 0.0, 10.0, 1.0)           # [(value, voltages, currents), ...]
-ac_sweep(c, 10.0, 100e3, points_per_decade=10)   # complex phasors per frequency
-transient(c, t_stop=5e-3, h=10e-6, method="trap")  # [(t, voltages, currents), ...]
-solve_nonlinear_dc(c)                        # (voltages, currents, n_iterations)
-```
+- **Elements**: resistors, independent voltage/current sources, capacitors,
+  inductors, all four controlled sources (VCVS/VCCS/CCVS/CCCS), and a Shockley
+  diode.
+- **One extensible stamp interface.** Every element knows only how to add its
+  own contribution to the matrix; the solver never branches on element type.
+- **Two integration methods** for transient — backward Euler and trapezoidal —
+  which makes numerical damping something you can see rather than read about.
+- **A real netlist parser**, not a CSV reader: continuation lines, SPICE unit
+  prefixes with the `meg`/`m` distinction, inline comments, arbitrary node names.
+- **Usable as a library or as a CLI**, with the same objects driving every
+  analysis.
+- **Errors that name the thing that is wrong** — a floating node is reported by
+  name, not as a singular-matrix traceback.
 
 ## How it works
 
@@ -95,33 +49,53 @@ solved system is `A x = z`, block-structured as
 
 `G` is the conductance matrix from resistors, and `B`/`B^T` couple in the
 extra current unknown owned by each element that can't be written as a
-conductance — voltage sources, VCVS, CCVS, and inductors. Ground (`0` or
-`gnd`) is *eliminated* from the system rather than pinned to zero; that is
-what keeps `A` nonsingular.
+conductance — voltage sources, VCVS, CCVS, and inductors.
 
-Every element only knows how to add its own contribution ("stamp") to `A` and
-`z`, so the solver never special-cases element types. There are three stamps:
-`stamp()` for DC into a real matrix, `stamp_ac()` for a complex matrix at
-angular frequency ω, and `stamp_tran()` for one timestep of size `h`. Elements
-that don't care about frequency or history inherit the DC stamp for the
-other two.
+**Modified nodal analysis rather than plain nodal analysis** is the whole reason
+for that second block. Plain nodal analysis cannot express an ideal voltage
+source: there is no conductance that forces a node voltage. MNA's answer is to
+add the branch current as an unknown and the constraint as an equation, which
+costs one row and one column per such element and buys the ability to handle
+ideal sources, inductors and current-controlled elements without approximating
+any of them as a small resistance.
 
-Reactive elements in transient are replaced each step by their companion
-model — a conductance plus a history-dependent source — and the result is
-solved exactly like a DC operating point. Diodes work the same way, except
-the companion is a tangent-line fit re-derived at every Newton iteration.
+**Ground is eliminated from the system rather than pinned to zero.** Keeping a
+ground row and setting it to `V = 0` works, but it leaves a redundant equation
+and a matrix that is singular until you patch it. Deleting the row and column
+makes `A` nonsingular by construction — the reference node is defined by its
+absence.
+
+**Every element only knows how to add its own contribution ("stamp")** to `A`
+and `z`, so the solver never special-cases element types. There are three
+stamps: `stamp()` for DC into a real matrix, `stamp_ac()` for a complex matrix
+at angular frequency ω, and `stamp_tran()` for one timestep of size `h`.
+Elements that don't care about frequency or history inherit the DC stamp for the
+other two, so adding a new resistive element means writing one method.
+
+**Reactive elements in transient are replaced each step by their companion
+model** — a conductance plus a history-dependent source — and the result is
+solved exactly like a DC operating point. That is the trick that makes one
+linear solver serve all four analyses: differential equations become algebraic
+ones, one timestep at a time. Diodes work the same way, except the companion is
+a tangent-line fit re-derived at every Newton iteration.
 
 A few design choices worth calling out:
 
-- An inductor is stamped as a branch current with `-jωL` on its own
-  diagonal, not as a `1/(jωL)` admittance, so it degenerates cleanly to the
-  DC short as ω → 0 instead of blowing up.
-- Newton iteration on a diode uses a simplified version of SPICE's `pnjlim`
-  voltage limiting. Without it the linear extrapolation overshoots deep into
-  the exponential and oscillates forever; there's a test that shows exactly
-  that.
-- A node no element touches is reported by name as floating, rather than
-  surfacing as a generic `LinAlgError` from numpy.
+- **An inductor is stamped as a branch current with `-jωL` on its own diagonal,
+  not as a `1/(jωL)` admittance.** The admittance form goes to infinity as
+  ω → 0; the branch-current form degenerates cleanly to the DC short. That
+  matters because `.ac` sweeps routinely start near DC, and a formulation that
+  blows up at the first frequency point is not usable.
+- **Newton iteration on a diode uses a simplified version of SPICE's `pnjlim`
+  voltage limiting.** Without it the linear extrapolation overshoots deep into
+  the exponential and oscillates forever — the diode's `exp(V/nVt)` means a
+  Newton step of a few hundred millivolts is a factor of e^10 in current.
+  Limiting the per-iteration voltage change is what makes the nonlinear solve
+  converge at all.
+- **A node no element touches is reported by name as floating**, rather than
+  surfacing as a generic `LinAlgError` from numpy. The information needed to say
+  which node is in the data structure; not using it is a choice, and the wrong
+  one.
 
 ## Netlist format
 
@@ -159,30 +133,8 @@ The parsing details it deliberately gets right are the ones that separate
   an ammeter — again, exactly like SPICE.
 
 `AC mag [phase]` only matters to `.ac`; `IC=` only matters to `.tran`. Putting
-either on an element that can't use it is an error, not a silent no-op.
-
-## Testing
-
-```bash
-pytest test_mna.py -q
-```
-
-91 tests. Results are checked against closed-form solutions rather than
-spot-checked for plausibility:
-
-- **AC** against the RC low-pass and RL high-pass transfer functions, including
-  the −3 dB / −45° corner.
-- **Transient** against the analytic RC and RL step responses, plus an
-  energy-conservation check on a lossless LC tank that demonstrates backward
-  Euler's numerical damping against trapezoidal's near-conservation.
-- **The diode's** Newton-Raphson operating point against a closed form derived
-  via the Lambert W function — computed by an independent Newton iteration
-  written for the test, so it's a genuine cross-check rather than the solver
-  grading its own homework.
-
-Everything is verified through the Python API against hand-computed circuits
-first, so the numerics are independent of the netlist format, and then again
-end to end through the CLI.
+either on an element that can't use it is an error, not a silent no-op —
+silently ignoring a directive the user meant is worse than refusing it.
 
 ## Limitations
 
@@ -197,3 +149,40 @@ end to end through the CLI.
   from a time-varying stimulus
 - Diodes participate only in the DC operating point — nonlinear `.ac`/`.tran`
   around a Newton-solved bias point isn't implemented
+
+## Possible improvements
+
+- **Waveform sources (PULSE, SIN, PWL).** The single biggest gap in usefulness.
+  Without them a transient can only be started from an initial condition, which
+  rules out the most common thing anyone wants to simulate: a circuit's response
+  to a driven input. The stamp interface already takes a timestep, so the source
+  value just becomes a function of `t`.
+- **Nonlinear transient and AC.** Once a driven stimulus exists, the natural
+  next step is a Newton solve *inside* each timestep, and small-signal `.ac`
+  linearised about a Newton-solved DC bias point. That combination is what turns
+  the diode from a DC curiosity into a rectifier you can actually simulate, and
+  it is the prerequisite for any active device.
+- **A MOSFET model.** Level-1 Shichman-Hodges is about a page of code and is the
+  gateway to every interesting circuit — amplifiers, switches, logic gates. It
+  needs `.model` cards, which is the same parsing work as the next item.
+- **`.model` cards and `.subckt` hierarchy.** Inline parameters do not scale past
+  one or two devices. Both are parser features rather than solver features, so
+  they can land without touching the numerics.
+- **Adaptive timestep with local truncation error control.** Fixed-step
+  transient forces a choice between accuracy and runtime that SPICE stopped
+  making in 1973. LTE estimation from the difference between two integration
+  orders is the standard route, and the trapezoidal/backward-Euler pair is
+  already there to build it from.
+- **Sparse matrices with an ordered factorisation.** Dense LU is `O(n³)`; real
+  netlists are overwhelmingly sparse. `scipy.sparse` plus a fill-reducing
+  ordering would make hundred-node circuits practical.
+- **Gmin stepping and source stepping for nonlinear convergence.** `pnjlim`
+  handles the well-behaved cases; the standard fallbacks handle the rest, and
+  right now a non-converging circuit just fails.
+- **Noise and sensitivity analyses.** Both reuse the AC machinery — noise is a
+  weighted sum over element contributions at each frequency, and sensitivity
+  falls out of the adjoint system — so they are cheap additions relative to what
+  they add.
+- **Plotting.** Every analysis returns lists of numbers that someone then has to
+  plot themselves. A thin matplotlib wrapper would make the transient and AC
+  results readable without leaving the tool.
